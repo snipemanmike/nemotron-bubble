@@ -1033,10 +1033,17 @@ fn find_model_dir() -> Result<PathBuf> {
         candidates.push(cwd.join("models").join("nemotron_multi"));
     }
 
+    // Walk up from the executable so the model is found no matter the working
+    // directory. This matters for "Start with Windows", where Windows launches us
+    // with the working directory set to System32 — and for the cargo layout, where
+    // the exe sits in target\release\ but the model is in the project root.
     if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("models").join("nemotron"));
-            candidates.push(dir.join("models").join("nemotron_multi"));
+        let mut dir = exe.parent();
+        for _ in 0..5 {
+            let Some(d) = dir else { break };
+            candidates.push(d.join("models").join("nemotron"));
+            candidates.push(d.join("models").join("nemotron_multi"));
+            dir = d.parent();
         }
     }
 
