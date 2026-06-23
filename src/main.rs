@@ -45,8 +45,10 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOD_CONTROL,
-    RegisterHotKey, ReleaseCapture, SendInput, SetCapture, UnregisterHotKey, VK_CONTROL, VK_SPACE,
+    GetKeyNameTextW, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+    MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SendInput, SetCapture, SetFocus,
+    UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SPACE,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -63,7 +65,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_COMMAND, WM_CREATE,
     WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_HOTKEY, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WM_USER, WNDCLASSW,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN,
+    WM_TIMER, WM_USER, WNDCLASSW,
     WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
     WM_THEMECHANGED, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
@@ -88,7 +91,7 @@ const ANIM_TIMER_ID: usize = 77;
 const ANIM_INTERVAL_MS: u32 = 33; // ~30 fps
 
 const SETTINGS_WIDTH: i32 = 700;
-const SETTINGS_HEIGHT: i32 = 660;
+const SETTINGS_HEIGHT: i32 = 712;
 const HISTORY_EDIT_ID: usize = 3001;
 const NEMOTRON_SAMPLE_RATE: f64 = 16_000.0;
 const NEMOTRON_CHUNK_SIZE: usize = 8_960; // 560 ms at 16 kHz.
@@ -139,6 +142,8 @@ struct AppSettings {
     bubble_click_opens_settings: bool,
     show_floating_bubble: bool,
     tray_waveform_enabled: bool,
+    hotkey_mods: u32,
+    hotkey_vk: u32,
     paste_delay_ms: u64,
     history_limit: usize,
 }
@@ -156,6 +161,8 @@ impl Default for AppSettings {
             bubble_click_opens_settings: true,
             show_floating_bubble: true,
             tray_waveform_enabled: true,
+            hotkey_mods: MOD_CONTROL,
+            hotkey_vk: VK_SPACE as u32,
             paste_delay_ms: 60,
             history_limit: 20,
         }
@@ -186,6 +193,7 @@ struct AppState {
     target_hwnd: AtomicIsize,
     settings_hwnd: AtomicIsize,
     history_edit_hwnd: AtomicIsize,
+    capturing_hotkey: AtomicBool,
     drag: Mutex<Option<DragState>>,
     settings: Mutex<AppSettings>,
     history: Mutex<Vec<HistoryItem>>,
@@ -244,6 +252,7 @@ fn main() -> Result<()> {
         target_hwnd: AtomicIsize::new(0),
         settings_hwnd: AtomicIsize::new(0),
         history_edit_hwnd: AtomicIsize::new(0),
+        capturing_hotkey: AtomicBool::new(false),
         drag: Mutex::new(None),
         settings: Mutex::new(settings),
         history: Mutex::new(history),
@@ -669,15 +678,10 @@ unsafe fn run_window(app: Arc<AppState>) -> Result<()> {
         ShowWindow(settings_hwnd, SW_HIDE);
     }
 
-    let ok = RegisterHotKey(
-        hwnd,
-        HOTKEY_ID,
-        MOD_CONTROL,
-        VK_SPACE as u32,
-    );
-    if ok == 0 {
+    let snapshot = settings_snapshot(&app);
+    if !register_global_hotkey(hwnd, snapshot.hotkey_mods, snapshot.hotkey_vk) {
         update_ui(&app, |ui| {
-            ui.status = "Hotkey failed. Use the Start button or tray menu.".to_string();
+            ui.status = "Shortcut unavailable — open settings to choose another.".to_string();
         });
     }
 
@@ -721,6 +725,17 @@ unsafe extern "system" fn wnd_proc(
                 toggle_recording();
             }
             0
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if is_settings_window(hwnd) {
+                if let Some(app) = APP.get() {
+                    if app.capturing_hotkey.load(Ordering::SeqCst) {
+                        handle_capture_key(app, wparam as u32);
+                        return 0;
+                    }
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_point(lparam);
@@ -1534,6 +1549,150 @@ fn toggle_window_visibility() {
     }
 }
 
+// --- Global shortcut (customizable hotkey) ---------------------------------
+
+/// (Re)register the global hotkey on `hwnd`. MOD_NOREPEAT stops held keys from
+/// firing repeatedly. Returns false if the combo is reserved / already taken.
+fn register_global_hotkey(hwnd: HWND, mods: u32, vk: u32) -> bool {
+    if hwnd == null_mut() {
+        return false;
+    }
+    unsafe {
+        UnregisterHotKey(hwnd, HOTKEY_ID);
+        RegisterHotKey(hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk) != 0
+    }
+}
+
+fn key_is_down(vk: u16) -> bool {
+    unsafe { (GetKeyState(vk as i32) as u16 & 0x8000) != 0 }
+}
+
+/// Localised name of a single key ("Space", "F8", "A", ...).
+fn key_name(vk: u32) -> String {
+    unsafe {
+        let scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        if scan != 0 {
+            let lparam = (scan << 16) as i32;
+            let mut buf = [0u16; 64];
+            let len = GetKeyNameTextW(lparam, buf.as_mut_ptr(), buf.len() as i32);
+            if len > 0 {
+                return String::from_utf16_lossy(&buf[..len as usize]);
+            }
+        }
+    }
+    format!("Key {vk}")
+}
+
+/// Human-readable shortcut label like "Ctrl + Shift + Space".
+fn hotkey_label(mods: u32, vk: u32) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if mods & MOD_CONTROL != 0 {
+        parts.push("Ctrl".to_string());
+    }
+    if mods & MOD_ALT != 0 {
+        parts.push("Alt".to_string());
+    }
+    if mods & MOD_SHIFT != 0 {
+        parts.push("Shift".to_string());
+    }
+    if mods & MOD_WIN != 0 {
+        parts.push("Win".to_string());
+    }
+    parts.push(key_name(vk));
+    parts.join(" + ")
+}
+
+/// Enter capture mode: free the current hotkey so the next chord arrives as
+/// WM_KEYDOWN, and pull keyboard focus to the settings window.
+fn start_hotkey_capture(app: &Arc<AppState>) {
+    app.capturing_hotkey.store(true, Ordering::SeqCst);
+    unsafe {
+        let bubble = hwnd_from_app(app);
+        if bubble != null_mut() {
+            UnregisterHotKey(bubble, HOTKEY_ID);
+        }
+        let settings = settings_hwnd_from_app(app);
+        if settings != null_mut() {
+            SetFocus(settings);
+        }
+    }
+    update_ui(app, |ui| {
+        ui.status = "Press your shortcut...  (Esc to cancel)".to_string();
+    });
+}
+
+fn cancel_hotkey_capture(app: &Arc<AppState>) {
+    if !app.capturing_hotkey.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let s = settings_snapshot(app);
+    register_global_hotkey(hwnd_from_app(app), s.hotkey_mods, s.hotkey_vk);
+    update_ui(app, |ui| {
+        ui.status = "Shortcut unchanged.".to_string();
+    });
+}
+
+fn apply_captured_hotkey(app: &Arc<AppState>, mods: u32, vk: u32) {
+    app.capturing_hotkey.store(false, Ordering::SeqCst);
+    let bubble = hwnd_from_app(app);
+    if register_global_hotkey(bubble, mods, vk) {
+        {
+            let mut s = app
+                .settings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            s.hotkey_mods = mods;
+            s.hotkey_vk = vk;
+        }
+        save_settings(&settings_snapshot(app));
+        let label = hotkey_label(mods, vk);
+        update_ui(app, |ui| {
+            ui.status = format!("Shortcut set to {label}.");
+        });
+    } else {
+        // Roll back to the previous (still-working) binding.
+        let s = settings_snapshot(app);
+        register_global_hotkey(bubble, s.hotkey_mods, s.hotkey_vk);
+        update_ui(app, |ui| {
+            ui.status = "That combo is unavailable - try another.".to_string();
+        });
+    }
+}
+
+/// Handle a key press while capturing a new shortcut.
+fn handle_capture_key(app: &Arc<AppState>, vk: u32) {
+    let v = vk as u16;
+    if v == VK_CONTROL || v == VK_SHIFT || v == VK_MENU || v == VK_LWIN || v == VK_RWIN {
+        return; // a bare modifier — keep waiting for the main key
+    }
+    if v == VK_ESCAPE {
+        cancel_hotkey_capture(app);
+        return;
+    }
+    let mut mods = 0u32;
+    if key_is_down(VK_CONTROL) {
+        mods |= MOD_CONTROL;
+    }
+    if key_is_down(VK_MENU) {
+        mods |= MOD_ALT;
+    }
+    if key_is_down(VK_SHIFT) {
+        mods |= MOD_SHIFT;
+    }
+    if key_is_down(VK_LWIN) || key_is_down(VK_RWIN) {
+        mods |= MOD_WIN;
+    }
+    // Letters and digits would hijack normal typing without a modifier.
+    let needs_mod = (0x30..=0x5A).contains(&vk);
+    if mods == 0 && needs_mod {
+        update_ui(app, |ui| {
+            ui.status = "Add Ctrl, Alt, or Shift to that key.".to_string();
+        });
+        return; // stay in capture mode
+    }
+    apply_captured_hotkey(app, mods, vk);
+}
+
 fn handle_command(command: usize) {
     match command {
         IDM_START_STOP => toggle_recording(),
@@ -1650,6 +1809,20 @@ fn handle_settings_click(x: i32, y: i32) {
     let Some(app) = APP.get() else {
         return;
     };
+
+    // Shortcut rebind button: click to begin capture, click again to cancel.
+    if settings_shortcut_rect().contains(x, y) {
+        if app.capturing_hotkey.load(Ordering::SeqCst) {
+            cancel_hotkey_capture(app);
+        } else {
+            start_hotkey_capture(app);
+        }
+        return;
+    }
+    // Any other click ends an in-progress capture before doing its thing.
+    if app.capturing_hotkey.load(Ordering::SeqCst) {
+        cancel_hotkey_capture(app);
+    }
 
     if settings_close_rect().contains(x, y) {
         unsafe {
@@ -2244,9 +2417,10 @@ unsafe fn paint_settings(hwnd: HWND) {
     if hdc == null_mut() {
         return;
     }
+    let capturing = app.capturing_hotkey.load(Ordering::SeqCst);
     if let Some(mut canvas) = Canvas::new(SETTINGS_WIDTH, SETTINGS_HEIGHT) {
         // history = None: the live EDIT control paints the recent-dictations panel.
-        render_settings_canvas(&mut canvas, &settings, None);
+        render_settings_canvas(&mut canvas, &settings, None, capturing);
         canvas.blit_to(hdc);
     }
     EndPaint(hwnd, &ps);
@@ -2259,6 +2433,7 @@ unsafe fn render_settings_canvas(
     canvas: &mut Canvas,
     settings: &AppSettings,
     history: Option<&[HistoryItem]>,
+    capturing: bool,
 ) {
     let rows = setting_rows(settings);
     let cw = canvas.w;
@@ -2296,6 +2471,8 @@ unsafe fn render_settings_canvas(
         draw_button_bg(buf, cw, ch, settings_close_rect(), false);
         draw_button_bg(buf, cw, ch, settings_copy_latest_rect(), true);
         draw_button_bg(buf, cw, ch, settings_clear_history_rect(), false);
+        // shortcut rebind button (accent while capturing)
+        draw_button_bg(buf, cw, ch, settings_shortcut_rect(), capturing);
 
         for row in &rows {
             draw_toggle(buf, cw, ch, settings_toggle_rect(row.id), row.enabled);
@@ -2331,6 +2508,22 @@ unsafe fn render_settings_canvas(
     text_left(dc, "BEHAVIOR", 34, 82, 200, 18);
     text_left(dc, "HISTORY", right_card_x as i32 + 16, 82, 200, 18);
 
+    // shortcut row
+    SelectObject(dc, ui_font() as _);
+    SetTextColor(dc, rgb(233, 238, 244));
+    text_left(dc, "Global shortcut", 40, 115, 168, 20);
+    SelectObject(dc, small_font() as _);
+    SetTextColor(dc, rgb(124, 134, 148));
+    text_left(dc, "Click, then press your keys.", 40, 135, 168, 18);
+    SelectObject(dc, ui_font() as _);
+    SetTextColor(dc, rgb(245, 248, 252));
+    let shortcut_label = if capturing {
+        "Press keys...".to_string()
+    } else {
+        hotkey_label(settings.hotkey_mods, settings.hotkey_vk)
+    };
+    text_center(dc, &shortcut_label, settings_shortcut_rect());
+
     SetTextColor(dc, rgb(245, 248, 252));
     text_center(dc, "Copy Latest", settings_copy_latest_rect());
     SetTextColor(dc, rgb(214, 220, 230));
@@ -2339,7 +2532,7 @@ unsafe fn render_settings_canvas(
     SetTextColor(dc, rgb(126, 136, 150));
     text_left(
         dc,
-        "Selectable text — highlight and press Ctrl+C.",
+        "Select a line and copy with Ctrl+C.",
         right_card_x as i32 + 16,
         158,
         cw - right_card_x as i32 - 36,
@@ -2498,6 +2691,7 @@ fn toggle_settings_window() {
             return;
         }
         if IsWindowVisible(hwnd) != 0 {
+            cancel_hotkey_capture(app);
             ShowWindow(hwnd, SW_HIDE);
         } else {
             place_settings_window(hwnd);
@@ -2602,6 +2796,16 @@ fn settings_clear_history_rect() -> RectI {
     }
 }
 
+/// The clickable shortcut-rebind button at the top of the Behavior card.
+fn settings_shortcut_rect() -> RectI {
+    RectI {
+        left: 208,
+        top: 116,
+        right: 360,
+        bottom: 150,
+    }
+}
+
 fn settings_toggle_rect(id: usize) -> RectI {
     let index = match id {
         SETTINGS_TOGGLE_STARTUP => 0,
@@ -2616,7 +2820,8 @@ fn settings_toggle_rect(id: usize) -> RectI {
         SETTINGS_TOGGLE_TRAY_WAVEFORM => 9,
         _ => 0,
     };
-    let top = 118 + index as i32 * 49;
+    // Toggles begin below the shortcut row.
+    let top = 170 + index as i32 * 49;
     RectI {
         left: 32,
         top,
@@ -2883,7 +3088,7 @@ fn render_assets(out_dir: &str) -> Result<()> {
         let cw = SETTINGS_WIDTH;
         let ch = SETTINGS_HEIGHT;
         if let Some(mut canvas) = unsafe { Canvas::new(cw, ch) } {
-            unsafe { render_settings_canvas(&mut canvas, &settings, Some(&history)) };
+            unsafe { render_settings_canvas(&mut canvas, &settings, Some(&history), false) };
             let rgba = settings_to_rgba(canvas.pixels(), cw as usize, ch as usize, 16.0);
             write_png(&dir.join("settings.png"), cw as u32, ch as u32, &rgba)?;
         }
