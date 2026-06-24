@@ -17,7 +17,7 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     GlobalFree, HGLOBAL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
@@ -45,10 +45,11 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyNameTextW, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
-    MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SendInput, SetCapture, SetFocus,
-    UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_SPACE,
+    GetAsyncKeyState, GetKeyNameTextW, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
+    MOD_SHIFT, MOD_WIN, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SendInput, SetCapture,
+    SetFocus, UnregisterHotKey, VK_CONTROL, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN,
+    VK_SHIFT, VK_SPACE,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
@@ -76,6 +77,11 @@ use winreg::enums::HKEY_CURRENT_USER;
 const CLASS_NAME: &str = "NemotronBubbleWindow";
 const TRAY_ID: u32 = 1;
 const HOTKEY_ID: i32 = 42;
+const ENTER_HOTKEY_ID: i32 = 43;
+// Auto-stop recording after this many seconds without detected speech.
+const SILENCE_AUTO_STOP_SECS: u64 = 15;
+// Bar height above which we consider the user to be speaking.
+const VOICE_LEVEL_THRESHOLD: f32 = 0.12;
 const WM_TRAYICON: u32 = WM_USER + 1;
 const WM_UI_UPDATE: u32 = WM_APP + 1;
 
@@ -91,7 +97,7 @@ const ANIM_TIMER_ID: usize = 77;
 const ANIM_INTERVAL_MS: u32 = 33; // ~30 fps
 
 const SETTINGS_WIDTH: i32 = 700;
-const SETTINGS_HEIGHT: i32 = 712;
+const SETTINGS_HEIGHT: i32 = 748;
 const HISTORY_EDIT_ID: usize = 3001;
 const NEMOTRON_SAMPLE_RATE: f64 = 16_000.0;
 const NEMOTRON_CHUNK_SIZE: usize = 8_960; // 560 ms at 16 kHz.
@@ -110,6 +116,7 @@ const SETTINGS_TOGGLE_WAVEFORM: usize = 2007;
 const SETTINGS_TOGGLE_BUBBLE_CLICK_SETTINGS: usize = 2008;
 const SETTINGS_TOGGLE_FLOATING_BUBBLE: usize = 2009;
 const SETTINGS_TOGGLE_TRAY_WAVEFORM: usize = 2010;
+const SETTINGS_TOGGLE_ENTER_STOPS: usize = 2011;
 
 static APP: OnceCell<Arc<AppState>> = OnceCell::new();
 static UI_FONT: OnceCell<isize> = OnceCell::new();
@@ -142,6 +149,7 @@ struct AppSettings {
     bubble_click_opens_settings: bool,
     show_floating_bubble: bool,
     tray_waveform_enabled: bool,
+    enter_stops_recording: bool,
     hotkey_mods: u32,
     hotkey_vk: u32,
     paste_delay_ms: u64,
@@ -161,6 +169,7 @@ impl Default for AppSettings {
             bubble_click_opens_settings: true,
             show_floating_bubble: true,
             tray_waveform_enabled: true,
+            enter_stops_recording: false,
             hotkey_mods: MOD_CONTROL,
             hotkey_vk: VK_SPACE as u32,
             paste_delay_ms: 60,
@@ -184,6 +193,7 @@ struct UiState {
     model_dir: String,
     waveform: Vec<f32>,
     current_level: f32,
+    last_voice: Instant,
 }
 
 struct AppState {
@@ -194,6 +204,7 @@ struct AppState {
     settings_hwnd: AtomicIsize,
     history_edit_hwnd: AtomicIsize,
     capturing_hotkey: AtomicBool,
+    enter_pending: AtomicBool,
     drag: Mutex<Option<DragState>>,
     settings: Mutex<AppSettings>,
     history: Mutex<Vec<HistoryItem>>,
@@ -222,6 +233,8 @@ impl RectI {
 }
 
 fn main() -> Result<()> {
+    install_crash_logger();
+
     if env::args().any(|arg| arg == "--self-test") {
         return self_test();
     }
@@ -253,6 +266,7 @@ fn main() -> Result<()> {
         settings_hwnd: AtomicIsize::new(0),
         history_edit_hwnd: AtomicIsize::new(0),
         capturing_hotkey: AtomicBool::new(false),
+        enter_pending: AtomicBool::new(false),
         drag: Mutex::new(None),
         settings: Mutex::new(settings),
         history: Mutex::new(history),
@@ -264,6 +278,7 @@ fn main() -> Result<()> {
             model_dir: String::new(),
             waveform: vec![0.0; WAVE_BARS],
             current_level: 0.0,
+            last_voice: Instant::now(),
         }),
     });
 
@@ -284,6 +299,29 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Append any panic (message + location, from any thread) to crash.log. The
+/// release build has no console, so without this a panic that aborts the process
+/// leaves no trace. Runs before unwinding, so it captures the cause even when the
+/// panic later aborts by crossing an FFI callback boundary.
+fn install_crash_logger() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let line = format!(
+            "[{}] {}\n",
+            Local::now().format("%Y-%m-%d %H:%M:%S"),
+            info
+        );
+        let path = app_data_dir().join("crash.log");
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = file.write_all(line.as_bytes());
+        }
+        default(info);
+    }));
 }
 
 fn self_test() -> Result<()> {
@@ -361,6 +399,9 @@ fn toggle_setting(app: &Arc<AppState>, id: usize) {
             SETTINGS_TOGGLE_TRAY_WAVEFORM => {
                 settings.tray_waveform_enabled = !settings.tray_waveform_enabled
             }
+            SETTINGS_TOGGLE_ENTER_STOPS => {
+                settings.enter_stops_recording = !settings.enter_stops_recording
+            }
             _ => {}
         }
         settings.clone()
@@ -368,6 +409,17 @@ fn toggle_setting(app: &Arc<AppState>, id: usize) {
 
     save_settings(&settings);
     apply_startup_setting(settings.start_with_windows);
+    // If toggled during a live recording, add/remove the Enter hotkey immediately.
+    if id == SETTINGS_TOGGLE_ENTER_STOPS && app.recording.load(Ordering::SeqCst) {
+        unsafe {
+            let hwnd = hwnd_from_app(app);
+            if settings.enter_stops_recording {
+                register_enter_hotkey(hwnd);
+            } else {
+                unregister_enter_hotkey(hwnd);
+            }
+        }
+    }
     if settings.preload_model {
         let _ = app.engine_tx.send(EngineCommand::Preload);
     }
@@ -721,8 +773,19 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_HOTKEY => {
-            if wparam as i32 == HOTKEY_ID {
-                toggle_recording();
+            match wparam as i32 {
+                HOTKEY_ID => toggle_recording(),
+                ENTER_HOTKEY_ID => {
+                    if let Some(app) = APP.get() {
+                        if app.recording.load(Ordering::SeqCst) {
+                            // Stop, then the engine re-injects Enter once the full
+                            // transcript has been typed (so the text submits).
+                            app.enter_pending.store(true, Ordering::SeqCst);
+                            stop_recording(app);
+                        }
+                    }
+                }
+                _ => {}
             }
             0
         }
@@ -1000,6 +1063,11 @@ fn run_engine(rx: Receiver<EngineCommand>, app: Arc<AppState>) {
                         ui.recording = false;
                         ui.status = "Ready. Press Ctrl+Space to start.".to_string();
                     });
+                }
+                // If this stop was triggered by Enter, submit now that the full
+                // transcript has been typed.
+                if app.enter_pending.swap(false, Ordering::SeqCst) {
+                    let _ = unsafe { send_enter() };
                 }
             }
             Ok(EngineCommand::Shutdown) | Err(_) => break,
@@ -1283,15 +1351,21 @@ fn toggle_recording() {
 fn start_recording(app: &Arc<AppState>) {
     remember_target_window(app);
     app.recording.store(true, Ordering::SeqCst);
+    app.enter_pending.store(false, Ordering::SeqCst);
     let _ = app.engine_tx.send(EngineCommand::Start);
     update_ui(app, |ui| {
         ui.recording = true;
         ui.visible = true;
         ui.status = "Starting...".to_string();
         ui.transcript.clear();
+        ui.last_voice = Instant::now(); // reset the silence timer
     });
     unsafe {
         let hwnd = hwnd_from_app(app);
+        // While recording, optionally let Enter end the session.
+        if settings_snapshot(app).enter_stops_recording {
+            register_enter_hotkey(hwnd);
+        }
         if hwnd != null_mut() && settings_snapshot(app).show_floating_bubble {
             ShowWindow(hwnd, SW_SHOWNA);
         }
@@ -1311,12 +1385,28 @@ fn remember_target_window(app: &Arc<AppState>) {
 
 fn stop_recording(app: &Arc<AppState>) {
     app.recording.store(false, Ordering::SeqCst);
+    unsafe {
+        // Release the temporary Enter hotkey before the engine re-injects Enter.
+        unregister_enter_hotkey(hwnd_from_app(app));
+    }
     play_stop_sound(app);
     let _ = app.engine_tx.send(EngineCommand::Stop);
     update_ui(app, |ui| {
         ui.recording = false;
         ui.status = "Finalizing...".to_string();
     });
+}
+
+unsafe fn register_enter_hotkey(hwnd: HWND) {
+    if hwnd != null_mut() {
+        RegisterHotKey(hwnd, ENTER_HOTKEY_ID, MOD_NOREPEAT, VK_RETURN as u32);
+    }
+}
+
+unsafe fn unregister_enter_hotkey(hwnd: HWND) {
+    if hwnd != null_mut() {
+        UnregisterHotKey(hwnd, ENTER_HOTKEY_ID);
+    }
 }
 
 fn play_start_sound(app: &Arc<AppState>) {
@@ -1479,8 +1569,18 @@ fn unicode_input(unit: u16, extra_flags: u32) -> INPUT {
 /// this never touches the clipboard, so live dictation can stream into the cursor
 /// without clobbering whatever the user has copied. UTF-16 (incl. surrogate pairs)
 /// is sent verbatim.
+///
+/// Critically, it first releases any modifier the user is physically holding
+/// (e.g. the Ctrl from the Ctrl+Space stop hotkey). Otherwise Windows folds the
+/// injected characters into Ctrl/Alt+key shortcuts and the focused app fires them
+/// (opening tabs, switching apps, etc.).
 unsafe fn send_unicode(text: &str) -> Result<()> {
-    let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2 + 4);
+    for vk in [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN] {
+        if (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 {
+            inputs.push(keyboard_input(vk, KEYEVENTF_KEYUP));
+        }
+    }
     for unit in text.encode_utf16() {
         inputs.push(unicode_input(unit, 0));
         inputs.push(unicode_input(unit, KEYEVENTF_KEYUP));
@@ -1495,6 +1595,24 @@ unsafe fn send_unicode(text: &str) -> Result<()> {
     );
     if sent != inputs.len() as u32 {
         return Err(anyhow!("unicode injection failed"));
+    }
+    Ok(())
+}
+
+/// Synthesize a single Enter key press (used by Enter-to-stop to submit the text
+/// after the full transcript has been typed).
+unsafe fn send_enter() -> Result<()> {
+    let inputs = [
+        keyboard_input(VK_RETURN, 0),
+        keyboard_input(VK_RETURN, KEYEVENTF_KEYUP),
+    ];
+    let sent = SendInput(
+        inputs.len() as u32,
+        inputs.as_ptr(),
+        std::mem::size_of::<INPUT>() as i32,
+    );
+    if sent != inputs.len() as u32 {
+        return Err(anyhow!("Enter injection failed"));
     }
     Ok(())
 }
@@ -1867,6 +1985,7 @@ fn handle_settings_click(x: i32, y: i32) {
         SETTINGS_TOGGLE_BUBBLE_CLICK_SETTINGS,
         SETTINGS_TOGGLE_FLOATING_BUBBLE,
         SETTINGS_TOGGLE_TRAY_WAVEFORM,
+        SETTINGS_TOGGLE_ENTER_STOPS,
     ] {
         if settings_toggle_rect(id).contains(x, y) {
             toggle_setting(app, id);
@@ -1909,6 +2028,9 @@ fn report_level(app: &Arc<AppState>, target: f32) {
         prev * 0.78 + target * 0.22
     };
     ui.current_level = smoothed.clamp(0.0, 1.0);
+    if target > VOICE_LEVEL_THRESHOLD {
+        ui.last_voice = Instant::now();
+    }
 }
 
 /// UI-thread tick: scroll the rolling waveform buffer by one sample of the current
@@ -2322,7 +2444,20 @@ unsafe fn on_anim_tick(hwnd: HWND) {
     };
     let peak = advance_waveform(app);
     let settings = settings_snapshot(app);
-    let recording = lock_ui(app).recording;
+    let (recording, silent_for) = {
+        let ui = lock_ui(app);
+        (ui.recording, ui.last_voice.elapsed())
+    };
+
+    // Auto-stop after a stretch of silence so a forgotten recording cannot run
+    // forever (and let the model's audio buffer grow without bound).
+    if recording && silent_for >= Duration::from_secs(SILENCE_AUTO_STOP_SECS) {
+        stop_recording(app);
+        update_ui(app, |ui| {
+            ui.status = format!("Auto-stopped after {SILENCE_AUTO_STOP_SECS}s of silence.");
+        });
+        return;
+    }
 
     if settings.show_floating_bubble && IsWindowVisible(hwnd) != 0 && (recording || peak > 0.004) {
         render_bubble(hwnd);
@@ -2409,6 +2544,12 @@ fn setting_rows(settings: &AppSettings) -> Vec<SettingRow> {
             title: "Animate the tray icon",
             detail: "Pulse the taskbar tray icon while speaking.",
             enabled: settings.tray_waveform_enabled,
+        },
+        SettingRow {
+            id: SETTINGS_TOGGLE_ENTER_STOPS,
+            title: "Enter stops recording",
+            detail: "Press Enter to finish and submit the text.",
+            enabled: settings.enter_stops_recording,
         },
     ]
 }
@@ -2825,6 +2966,7 @@ fn settings_toggle_rect(id: usize) -> RectI {
         SETTINGS_TOGGLE_BUBBLE_CLICK_SETTINGS => 7,
         SETTINGS_TOGGLE_FLOATING_BUBBLE => 8,
         SETTINGS_TOGGLE_TRAY_WAVEFORM => 9,
+        SETTINGS_TOGGLE_ENTER_STOPS => 10,
         _ => 0,
     };
     // Toggles begin below the shortcut row.
