@@ -80,8 +80,9 @@ const HOTKEY_ID: i32 = 42;
 const ENTER_HOTKEY_ID: i32 = 43;
 // Auto-stop recording after this many seconds without detected speech.
 const SILENCE_AUTO_STOP_SECS: u64 = 15;
-// Bar height above which we consider the user to be speaking.
-const VOICE_LEVEL_THRESHOLD: f32 = 0.12;
+// Raw mic RMS above which we treat the user as speaking (for the silence auto-stop).
+// Compared against true loudness, NOT the visually-boosted bar height.
+const VOICE_RMS_THRESHOLD: f32 = 0.02;
 const WM_TRAYICON: u32 = WM_USER + 1;
 const WM_UI_UPDATE: u32 = WM_APP + 1;
 
@@ -996,6 +997,9 @@ fn run_engine(rx: Receiver<EngineCommand>, app: Arc<AppState>) {
             }
             Ok(EngineCommand::Stop) => {
                 app.recording.store(false, Ordering::SeqCst);
+                // Enter-to-stop wants a near-instant finish, so skip the extra
+                // silence-flush passes (they only squeeze out a touch more tail).
+                let fast = app.enter_pending.load(Ordering::SeqCst);
                 if active {
                     active = false;
                     if let Some(model) = model.as_mut() {
@@ -1006,7 +1010,8 @@ fn run_engine(rx: Receiver<EngineCommand>, app: Arc<AppState>) {
                             }
                             audio_buffer.clear();
                         }
-                        for _ in 0..3 {
+                        let flush_passes = if fast { 0 } else { 3 };
+                        for _ in 0..flush_passes {
                             if let Ok(text) = model.transcribe_chunk(&vec![0.0; NEMOTRON_CHUNK_SIZE])
                             {
                                 paste_live_tail(&app, &text);
@@ -1277,7 +1282,7 @@ impl InputCallback {
             let rms = (mono.iter().map(|v| v * v).sum::<f32>() / mono.len() as f32).sqrt();
             let norm = ((rms - NOISE_FLOOR) * GAIN).clamp(0.0, 1.0);
             let level = norm.powf(SHAPE);
-            report_level(&self.app, level);
+            report_level(&self.app, level, rms);
         }
 
         let mut out = Vec::new();
@@ -2018,7 +2023,7 @@ where
 /// Smooths it with a fast attack / slow release so the meter feels responsive but
 /// never jittery, then stashes it for the UI-thread animation timer to sample.
 /// Does no GDI work — drawing only happens on the UI thread.
-fn report_level(app: &Arc<AppState>, target: f32) {
+fn report_level(app: &Arc<AppState>, target: f32, rms: f32) {
     let target = target.clamp(0.0, 1.0);
     let mut ui = lock_ui(app);
     let prev = ui.current_level;
@@ -2028,7 +2033,7 @@ fn report_level(app: &Arc<AppState>, target: f32) {
         prev * 0.78 + target * 0.22
     };
     ui.current_level = smoothed.clamp(0.0, 1.0);
-    if target > VOICE_LEVEL_THRESHOLD {
+    if rms > VOICE_RMS_THRESHOLD {
         ui.last_voice = Instant::now();
     }
 }
