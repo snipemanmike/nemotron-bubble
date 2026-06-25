@@ -162,9 +162,11 @@ impl Default for AppSettings {
         Self {
             start_with_windows: true,
             preload_model: true,
-            live_type_into_cursor: true,
+            // Default to the safe clipboard path: live keystroke injection only behaves
+            // in real text fields, so it is opt-in. On stop we paste once (one Ctrl+V).
+            live_type_into_cursor: false,
             copy_final_to_clipboard: true,
-            paste_final_on_stop: false,
+            paste_final_on_stop: true,
             sounds_enabled: true,
             waveform_enabled: true,
             bubble_click_opens_settings: true,
@@ -1519,13 +1521,25 @@ fn set_clipboard_text(text: &str, owner_hwnd: HWND) -> Result<()> {
     Ok(())
 }
 
+/// Prepend key-up events for any modifier the user is physically holding, so an
+/// injected keystroke isn't folded into a Ctrl/Alt/Shift/Win shortcut (e.g. the
+/// Ctrl from the Ctrl+Space hotkey turning a typed char, a paste, or Enter into a
+/// command). Shared by every injection path.
+unsafe fn push_modifier_releases(inputs: &mut Vec<INPUT>) {
+    for vk in [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN] {
+        if (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 {
+            inputs.push(keyboard_input(vk, KEYEVENTF_KEYUP));
+        }
+    }
+}
+
 unsafe fn send_ctrl_v() -> Result<()> {
-    let inputs = [
-        keyboard_input(VK_CONTROL, 0),
-        keyboard_input('V' as u16, 0),
-        keyboard_input('V' as u16, KEYEVENTF_KEYUP),
-        keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP),
-    ];
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(8);
+    push_modifier_releases(&mut inputs); // clear stray Shift/Alt/Win before our clean Ctrl+V
+    inputs.push(keyboard_input(VK_CONTROL, 0));
+    inputs.push(keyboard_input('V' as u16, 0));
+    inputs.push(keyboard_input('V' as u16, KEYEVENTF_KEYUP));
+    inputs.push(keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP));
 
     let sent = SendInput(
         inputs.len() as u32,
@@ -1581,11 +1595,7 @@ fn unicode_input(unit: u16, extra_flags: u32) -> INPUT {
 /// (opening tabs, switching apps, etc.).
 unsafe fn send_unicode(text: &str) -> Result<()> {
     let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2 + 4);
-    for vk in [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN] {
-        if (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 {
-            inputs.push(keyboard_input(vk, KEYEVENTF_KEYUP));
-        }
-    }
+    push_modifier_releases(&mut inputs);
     for unit in text.encode_utf16() {
         inputs.push(unicode_input(unit, 0));
         inputs.push(unicode_input(unit, KEYEVENTF_KEYUP));
@@ -1607,10 +1617,10 @@ unsafe fn send_unicode(text: &str) -> Result<()> {
 /// Synthesize a single Enter key press (used by Enter-to-stop to submit the text
 /// after the full transcript has been typed).
 unsafe fn send_enter() -> Result<()> {
-    let inputs = [
-        keyboard_input(VK_RETURN, 0),
-        keyboard_input(VK_RETURN, KEYEVENTF_KEYUP),
-    ];
+    let mut inputs: Vec<INPUT> = Vec::with_capacity(7);
+    push_modifier_releases(&mut inputs); // ensure a clean Enter, not Ctrl/Shift+Enter
+    inputs.push(keyboard_input(VK_RETURN, 0));
+    inputs.push(keyboard_input(VK_RETURN, KEYEVENTF_KEYUP));
     let sent = SendInput(
         inputs.len() as u32,
         inputs.as_ptr(),
@@ -2505,7 +2515,7 @@ fn setting_rows(settings: &AppSettings) -> Vec<SettingRow> {
         SettingRow {
             id: SETTINGS_TOGGLE_LIVE_TYPE,
             title: "Type live into cursor",
-            detail: "Type words as you speak (no clipboard).",
+            detail: "As you speak. Text fields only - off is safer.",
             enabled: settings.live_type_into_cursor,
         },
         SettingRow {

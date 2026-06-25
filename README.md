@@ -21,7 +21,8 @@ Press your shortcut, speak, and your words appear at the cursor — powered by *
 
 - **Push-to-talk** — one shortcut starts and stops dictation from any app.
 - **Customizable shortcut** — click *Global shortcut* in settings and press any combo (Ctrl / Alt / Shift + key). Defaults to `Ctrl+Space`.
-- **Types as you speak** — words stream into the focused window as real keystrokes; your **clipboard is never touched** until you stop.
+- **Safe insertion by default** — on stop the transcript is pasted once (clipboard + a single Ctrl+V), so it never trips app shortcuts. *Type live into cursor* is an opt-in for real text editors.
+- **Auto-stops on silence** — forgets nothing but won't run forever; stops after 15 s of quiet.
 - **Private and offline** — runs the Nemotron ONNX model locally. No internet, no accounts, no telemetry.
 - **Live waveform bubble** — a smooth, anti-aliased floating mic meter you can drag anywhere.
 - **Tray mode** — hide the bubble and watch the waveform pulse right in the taskbar tray instead.
