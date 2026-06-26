@@ -61,12 +61,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func configureStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(
-            systemSymbolName: "mic.circle",
-            accessibilityDescription: "Nemotron Bubble"
-        )
-        item.button?.image?.isTemplate = true
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.button?.image = makeMenuBarImage(level: 0, recording: false)
+        item.button?.imagePosition = .imageOnly
+        item.button?.imageScaling = .scaleProportionallyDown
         statusItem = item
         rebuildMenu()
     }
@@ -131,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         engine.onLevel = { [weak self] level in
             guard let self else { return }
+            self.bubble.setWaveformEnabled(self.preferences.waveformEnabled)
             if self.preferences.waveformEnabled {
                 self.bubble.setLevel(level)
             } else {
@@ -237,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func refreshAll() {
         refreshMenu()
+        bubble.setWaveformEnabled(preferences.waveformEnabled)
         updateStatusIcon()
         settingsWindow.refresh(
             preferences: preferences,
@@ -699,37 +699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makeMenuBarImage(level: Float, recording: Bool) -> NSImage {
-        let size = NSSize(width: 22, height: 18)
-        let image = NSImage(size: size)
-        image.lockFocus()
-
-        NSColor.clear.setFill()
-        NSRect(origin: .zero, size: size).fill()
-
-        let color = recording ? NSColor.systemRed : NSColor.secondaryLabelColor
-        color.setFill()
-
-        let dot = NSBezierPath(ovalIn: NSRect(x: 1.5, y: 6.0, width: 6.0, height: 6.0))
-        dot.fill()
-
-        let bars = 5
-        let boosted = CGFloat(recording ? max(0.08, min(1.0, level)) : 0.20)
-        for index in 0..<bars {
-            let phase = CGFloat(index) / CGFloat(max(1, bars - 1))
-            let wave = 0.35 + 0.65 * sin((phase + boosted) * .pi)
-            let height = max(3.0, 12.0 * boosted * wave)
-            let rect = NSRect(
-                x: 10.0 + CGFloat(index) * 2.5,
-                y: (size.height - height) / 2.0,
-                width: 1.6,
-                height: height
-            )
-            NSBezierPath(roundedRect: rect, xRadius: 0.8, yRadius: 0.8).fill()
-        }
-
-        image.unlockFocus()
-        image.isTemplate = false
-        return image
+        WindowsVisualRenderer.makeMenuBarImage(level: CGFloat(level), recording: recording)
+            ?? NSImage(size: NSSize(width: 22, height: 22))
     }
 
     private func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
