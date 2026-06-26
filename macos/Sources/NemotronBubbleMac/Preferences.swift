@@ -63,6 +63,11 @@ final class Preferences {
         set { defaults.set(newValue, forKey: "enterStopsRecording") }
     }
 
+    var commandHoldToRecord: Bool {
+        get { bool(for: "commandHoldToRecord", default: true) }
+        set { defaults.set(newValue, forKey: "commandHoldToRecord") }
+    }
+
     var pasteDelayMs: Int {
         get {
             guard defaults.object(forKey: "pasteDelayMs") != nil else { return 60 }

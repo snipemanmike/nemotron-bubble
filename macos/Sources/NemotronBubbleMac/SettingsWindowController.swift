@@ -12,6 +12,7 @@ enum SettingsKey: CaseIterable {
     case showFloatingBubble
     case menuBarWaveformEnabled
     case enterStopsRecording
+    case commandHoldToRecord
 
     var title: String {
         switch self {
@@ -26,6 +27,7 @@ enum SettingsKey: CaseIterable {
         case .showFloatingBubble: "Floating Bubble"
         case .menuBarWaveformEnabled: "Menu Bar Waveform"
         case .enterStopsRecording: "Enter Stops Recording"
+        case .commandHoldToRecord: "Hold Command to Record"
         }
     }
 }
@@ -89,6 +91,7 @@ final class SettingsWindowController: NSWindowController {
         toggleButtons[.showFloatingBubble]?.state = preferences.showFloatingBubble ? .on : .off
         toggleButtons[.menuBarWaveformEnabled]?.state = preferences.menuBarWaveformEnabled ? .on : .off
         toggleButtons[.enterStopsRecording]?.state = preferences.enterStopsRecording ? .on : .off
+        toggleButtons[.commandHoldToRecord]?.state = preferences.commandHoldToRecord ? .on : .off
 
         let history = preferences.history
             .map { "\($0.timestamp)\n\($0.text)" }

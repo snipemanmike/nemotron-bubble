@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKey: HotKeyController?
     private var enterHotKey: HotKeyController?
     private var shortcutCaptureMonitor: Any?
+    private var commandHoldMonitor: Any?
+    private var commandHoldStartedRecording = false
+    private var commandHoldCancelled = false
 
     private var startStopItem = NSMenuItem()
     private var settingsItem = NSMenuItem()
@@ -34,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureSettingsWindow()
         configureEngineCallbacks()
         configureAudioCapture()
+        configureCommandHoldMonitor()
         engine.start()
         registerHotKey()
         LoginItemController.setEnabled(preferences.startAtLogin)
@@ -51,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         unregisterEnterHotKey()
+        removeCommandHoldMonitor()
         audioCapture.stop()
         hotKey?.unregister()
         engine.shutdown()
@@ -144,6 +149,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func configureAudioCapture() {
         audioCapture.onAudio = { [weak self] samples, sampleRate in
             self?.engine.sendAudio(samples: samples, sampleRate: sampleRate)
+        }
+    }
+
+    private func configureCommandHoldMonitor() {
+        removeCommandHoldMonitor()
+        commandHoldMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.flagsChanged, .keyDown]
+        ) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleCommandHoldEvent(event)
+            }
+        }
+    }
+
+    private func removeCommandHoldMonitor() {
+        if let monitor = commandHoldMonitor {
+            NSEvent.removeMonitor(monitor)
+            commandHoldMonitor = nil
         }
     }
 
@@ -395,9 +418,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .enterStopsRecording:
             preferences.enterStopsRecording.toggle()
             preferences.enterStopsRecording ? registerEnterHotKeyIfNeeded() : unregisterEnterHotKey()
+        case .commandHoldToRecord:
+            preferences.commandHoldToRecord.toggle()
         }
 
         setStatus("Settings saved.")
+    }
+
+    private func handleCommandHoldEvent(_ event: NSEvent) {
+        guard preferences.commandHoldToRecord, shortcutCaptureMonitor == nil else { return }
+
+        if event.type == .keyDown {
+            if commandHoldStartedRecording,
+               event.modifierFlags.contains(.command),
+               Int(event.keyCode) != kVK_Command,
+               Int(event.keyCode) != kVK_RightCommand {
+                commandHoldCancelled = true
+            }
+            return
+        }
+
+        guard event.type == .flagsChanged else { return }
+        let isCommandKey = Int(event.keyCode) == kVK_Command || Int(event.keyCode) == kVK_RightCommand
+        guard isCommandKey else {
+            if commandHoldStartedRecording, event.modifierFlags.contains(.command) {
+                commandHoldCancelled = true
+            }
+            return
+        }
+
+        let commandIsDown = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
+        if commandIsDown {
+            if !engine.isRecording {
+                commandHoldCancelled = false
+                commandHoldStartedRecording = true
+                startRecording()
+            }
+        } else if commandHoldStartedRecording {
+            let shouldStop = engine.isRecording && !commandHoldCancelled
+            commandHoldStartedRecording = false
+            commandHoldCancelled = false
+            if shouldStop {
+                stopRecording(fast: false)
+            }
+        }
     }
 
     private func registerHotKey() {
