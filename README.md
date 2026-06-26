@@ -5,11 +5,10 @@
 **A tiny, beautiful push-to-talk dictation bubble for Windows.**
 
 > macOS support is available on the `macos-support` branch under `macos/`.
-> The Mac app is a native menu-bar companion that uses Apple's Speech framework.
+> The Mac app is a native menu-bar app with a bundled Rust Nemotron engine.
 
-Press your shortcut, speak, and your words appear at the cursor. The Windows app
-is powered by **on-device** NVIDIA Nemotron speech recognition; the macOS
-companion uses Apple's Speech framework.
+Press your shortcut, speak, and your words appear at the cursor — powered by
+**on-device** NVIDIA Nemotron speech recognition.
 
 <img src="docs/demo.gif" width="460" alt="Nemotron Bubble live waveform" />
 

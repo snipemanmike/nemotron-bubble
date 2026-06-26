@@ -26,7 +26,5 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Nemotron Bubble records microphone audio while dictation is active.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Nemotron Bubble uses speech recognition to turn your dictation into text.</string>
 </dict>
 </plist>
