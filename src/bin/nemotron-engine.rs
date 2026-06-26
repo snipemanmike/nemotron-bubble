@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parakeet_rs::{Nemotron, NemotronMode};
@@ -20,6 +21,7 @@ const VOICE_RMS_THRESHOLD: f32 = 0.02;
 enum EngineCommand {
     Preload,
     Start,
+    RawAudio { samples: Vec<f32>, sample_rate: f64 },
     Audio(Vec<f32>),
     Stop { fast: bool, auto: bool },
     Shutdown,
@@ -30,6 +32,7 @@ enum EngineCommand {
 enum ClientCommand {
     Preload,
     Start,
+    Audio { sample_rate: f64, data: String },
     Stop { fast: Option<bool> },
     Shutdown,
 }
@@ -169,22 +172,31 @@ fn main() -> Result<()> {
     thread::spawn(move || write_events(event_rx));
     spawn_command_reader(command_tx.clone());
 
-    let audio_stream = match start_audio_capture(
-        recording.clone(),
-        command_tx.clone(),
-        event_tx.clone(),
-        last_voice.clone(),
-    ) {
-        Ok(stream) => stream,
-        Err(err) => {
-            let _ = event_tx.send(EngineEvent::error(format!("Microphone error: {err:#}")));
-            return Err(err);
-        }
+    let stdin_audio = env::args().any(|arg| arg == "--stdin-audio");
+    let _keep_audio_alive = if stdin_audio {
+        let _ = event_tx.send(EngineEvent::status(
+            "Ready. Mic is handled by Nemotron Bubble.",
+        ));
+        None
+    } else {
+        Some(
+            match start_audio_capture(
+                recording.clone(),
+                command_tx.clone(),
+                event_tx.clone(),
+                last_voice.clone(),
+            ) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let _ = event_tx.send(EngineEvent::error(format!("Microphone error: {err:#}")));
+                    return Err(err);
+                }
+            },
+        )
     };
 
-    let _keep_audio_alive = audio_stream;
     let _ = event_tx.send(EngineEvent::status("Ready. Press Ctrl-Space to start."));
-    run_engine(command_rx, event_tx, recording, last_voice);
+    run_engine(command_rx, command_tx, event_tx, recording, last_voice);
     Ok(())
 }
 
@@ -200,6 +212,15 @@ fn spawn_command_reader(tx: Sender<EngineCommand>) {
             let command = match serde_json::from_str::<ClientCommand>(&line) {
                 Ok(ClientCommand::Preload) => EngineCommand::Preload,
                 Ok(ClientCommand::Start) => EngineCommand::Start,
+                Ok(ClientCommand::Audio { sample_rate, data }) => {
+                    let Ok(samples) = decode_f32_base64(&data) else {
+                        continue;
+                    };
+                    EngineCommand::RawAudio {
+                        samples,
+                        sample_rate,
+                    }
+                }
                 Ok(ClientCommand::Stop { fast }) => EngineCommand::Stop {
                     fast: fast.unwrap_or(false),
                     auto: false,
@@ -215,6 +236,19 @@ fn spawn_command_reader(tx: Sender<EngineCommand>) {
 
         let _ = tx.send(EngineCommand::Shutdown);
     });
+}
+
+fn decode_f32_base64(data: &str) -> Result<Vec<f32>> {
+    let bytes = STANDARD.decode(data)?;
+    if bytes.len() % std::mem::size_of::<f32>() != 0 {
+        return Err(anyhow!("audio payload was not f32-aligned"));
+    }
+
+    let mut samples = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(samples)
 }
 
 fn write_events(rx: Receiver<EngineEvent>) {
@@ -233,6 +267,7 @@ fn write_events(rx: Receiver<EngineEvent>) {
 
 fn run_engine(
     rx: Receiver<EngineCommand>,
+    commands: Sender<EngineCommand>,
     events: Sender<EngineEvent>,
     recording: Arc<AtomicBool>,
     last_voice: Arc<Mutex<Instant>>,
@@ -241,6 +276,12 @@ fn run_engine(
     let mut active = false;
     let mut audio_buffer = Vec::<f32>::with_capacity(NEMOTRON_CHUNK_SIZE * 2);
     let mut live_transcript = String::new();
+    let mut stdin_audio = StdinAudioProcessor::new(
+        events.clone(),
+        recording.clone(),
+        last_voice.clone(),
+        commands.clone(),
+    );
 
     loop {
         match rx.recv() {
@@ -265,6 +306,7 @@ fn run_engine(
             Ok(EngineCommand::Start) => {
                 audio_buffer.clear();
                 live_transcript.clear();
+                stdin_audio.reset();
                 recording.store(true, Ordering::SeqCst);
                 if let Ok(mut last_voice) = last_voice.lock() {
                     *last_voice = Instant::now();
@@ -296,32 +338,40 @@ fn run_engine(
                     let _ = events.send(EngineEvent::transcript("", ""));
                 }
             }
+            Ok(EngineCommand::RawAudio {
+                samples,
+                sample_rate,
+            }) => {
+                if !active {
+                    continue;
+                }
+                let samples = stdin_audio.process(sample_rate, &samples);
+                if samples.is_empty() {
+                    continue;
+                }
+                transcribe_audio(
+                    samples,
+                    model.as_mut(),
+                    &mut audio_buffer,
+                    &mut live_transcript,
+                    &events,
+                    &recording,
+                    &mut active,
+                );
+            }
             Ok(EngineCommand::Audio(samples)) => {
                 if !active {
                     continue;
                 }
-                let Some(model) = model.as_mut() else {
-                    continue;
-                };
-
-                audio_buffer.extend(samples);
-                while audio_buffer.len() >= NEMOTRON_CHUNK_SIZE {
-                    let chunk: Vec<f32> = audio_buffer.drain(..NEMOTRON_CHUNK_SIZE).collect();
-                    match model.transcribe_chunk(&chunk) {
-                        Ok(text) if !text.is_empty() => {
-                            live_transcript.push_str(&text);
-                            let _ =
-                                events.send(EngineEvent::transcript(live_transcript.clone(), text));
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            active = false;
-                            recording.store(false, Ordering::SeqCst);
-                            let _ = events.send(EngineEvent::recording(false));
-                            let _ = events.send(EngineEvent::error(format!("ASR error: {err:#}")));
-                        }
-                    }
-                }
+                transcribe_audio(
+                    samples,
+                    model.as_mut(),
+                    &mut audio_buffer,
+                    &mut live_transcript,
+                    &events,
+                    &recording,
+                    &mut active,
+                );
             }
             Ok(EngineCommand::Stop { fast, auto }) => {
                 recording.store(false, Ordering::SeqCst);
@@ -372,6 +422,120 @@ fn run_engine(
             }
             Ok(EngineCommand::Shutdown) | Err(_) => break,
         }
+    }
+}
+
+fn transcribe_audio(
+    samples: Vec<f32>,
+    model: Option<&mut Nemotron>,
+    audio_buffer: &mut Vec<f32>,
+    live_transcript: &mut String,
+    events: &Sender<EngineEvent>,
+    recording: &Arc<AtomicBool>,
+    active: &mut bool,
+) {
+    let Some(model) = model else {
+        return;
+    };
+
+    audio_buffer.extend(samples);
+    while audio_buffer.len() >= NEMOTRON_CHUNK_SIZE {
+        let chunk: Vec<f32> = audio_buffer.drain(..NEMOTRON_CHUNK_SIZE).collect();
+        match model.transcribe_chunk(&chunk) {
+            Ok(text) if !text.is_empty() => {
+                live_transcript.push_str(&text);
+                let _ = events.send(EngineEvent::transcript(live_transcript.clone(), text));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                *active = false;
+                recording.store(false, Ordering::SeqCst);
+                let _ = events.send(EngineEvent::recording(false));
+                let _ = events.send(EngineEvent::error(format!("ASR error: {err:#}")));
+            }
+        }
+    }
+}
+
+struct StdinAudioProcessor {
+    tx: Sender<EngineCommand>,
+    events: Sender<EngineEvent>,
+    recording: Arc<AtomicBool>,
+    last_voice: Arc<Mutex<Instant>>,
+    resampler: LinearResampler,
+    source_rate: f64,
+}
+
+impl StdinAudioProcessor {
+    fn new(
+        events: Sender<EngineEvent>,
+        recording: Arc<AtomicBool>,
+        last_voice: Arc<Mutex<Instant>>,
+        tx: Sender<EngineCommand>,
+    ) -> Self {
+        Self {
+            tx,
+            events,
+            recording,
+            last_voice,
+            resampler: LinearResampler::new(NEMOTRON_SAMPLE_RATE, NEMOTRON_SAMPLE_RATE),
+            source_rate: NEMOTRON_SAMPLE_RATE,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.resampler.reset();
+        if let Ok(mut last_voice) = self.last_voice.lock() {
+            *last_voice = Instant::now();
+        }
+    }
+
+    fn process(&mut self, sample_rate: f64, mono: &[f32]) -> Vec<f32> {
+        if !self.recording.load(Ordering::Relaxed) || mono.is_empty() {
+            return Vec::new();
+        }
+
+        if (self.source_rate - sample_rate).abs() > f64::EPSILON {
+            self.source_rate = sample_rate;
+            self.resampler = LinearResampler::new(sample_rate, NEMOTRON_SAMPLE_RATE);
+        }
+
+        self.report_level_and_silence(mono);
+
+        let mut out = Vec::new();
+        self.resampler.push(mono, &mut out);
+        out
+    }
+
+    fn report_level_and_silence(&mut self, mono: &[f32]) {
+        const NOISE_FLOOR: f32 = 0.006;
+        const GAIN: f32 = 14.0;
+        const SHAPE: f32 = 0.6;
+
+        let rms = (mono.iter().map(|v| v * v).sum::<f32>() / mono.len() as f32).sqrt();
+        let norm = ((rms - NOISE_FLOOR) * GAIN).clamp(0.0, 1.0);
+        let level = norm.powf(SHAPE);
+        let _ = self.events.try_send(EngineEvent::level(level));
+
+        if rms > VOICE_RMS_THRESHOLD {
+            if let Ok(mut last_voice) = self.last_voice.lock() {
+                *last_voice = Instant::now();
+            }
+        } else if self.silence_elapsed() >= Duration::from_secs(SILENCE_AUTO_STOP_SECS)
+            && self.recording.swap(false, Ordering::SeqCst)
+        {
+            let _ = self.tx.try_send(EngineCommand::Stop {
+                fast: false,
+                auto: true,
+            });
+        }
+    }
+
+    fn silence_elapsed(&self) -> Duration {
+        self.last_voice
+            .lock()
+            .map(|last_voice| last_voice.elapsed())
+            .unwrap_or_default()
     }
 }
 

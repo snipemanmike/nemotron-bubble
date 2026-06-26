@@ -4,6 +4,7 @@ import Carbon.HIToolbox
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let preferences = Preferences()
     private let engine = EngineClient()
+    private let audioCapture = AudioCaptureController()
     private let pasteboardTyper = PasteboardTyper()
     private let bubble = BubbleWindowController()
     private lazy var settingsWindow = SettingsWindowController()
@@ -32,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureBubble()
         configureSettingsWindow()
         configureEngineCallbacks()
+        configureAudioCapture()
         engine.start()
         registerHotKey()
         LoginItemController.setEnabled(preferences.startAtLogin)
@@ -49,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         unregisterEnterHotKey()
+        audioCapture.stop()
         hotKey?.unregister()
         engine.shutdown()
     }
@@ -100,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if isRecording {
                 self.registerEnterHotKeyIfNeeded()
             } else {
+                self.audioCapture.stop()
                 self.unregisterEnterHotKey()
             }
             self.refreshAll()
@@ -134,6 +138,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.onModelDir = { [weak self] path in
             self?.modelDir = path
             self?.refreshAll()
+        }
+    }
+
+    private func configureAudioCapture() {
+        audioCapture.onAudio = { [weak self] samples, sampleRate in
+            self?.engine.sendAudio(samples: samples, sampleRate: sampleRate)
         }
     }
 
@@ -248,11 +258,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bubble.setTranscript("")
         playStartSound()
         setStatus("Starting...")
+
+        do {
+            try audioCapture.start()
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            setStatus(message)
+            return
+        }
+
         engine.startRecording()
     }
 
     private func stopRecording(fast: Bool = false, submitEnter: Bool = false) {
         submitEnterAfterStop = submitEnter
+        audioCapture.stop()
         playStopSound()
         setStatus("Finalizing...")
         engine.stopRecording(fast: fast)

@@ -24,6 +24,7 @@ final class EngineClient {
     private var inputHandle: FileHandle?
     private var outputBuffer = Data()
     private let decoder = JSONDecoder()
+    private let writeQueue = DispatchQueue(label: "com.snipemanmike.NemotronBubbleMac.engine.write")
 
     private(set) var isRecording = false
 
@@ -37,6 +38,7 @@ final class EngineClient {
 
         let process = Process()
         process.executableURL = engineURL
+        process.arguments = ["--stdin-audio"]
         process.currentDirectoryURL = repositoryRootHint(from: engineURL)
         process.environment = ProcessInfo.processInfo.environment
 
@@ -91,6 +93,21 @@ final class EngineClient {
         send(["type": "stop", "fast": fast])
     }
 
+    func sendAudio(samples: [Float], sampleRate: Double) {
+        guard !samples.isEmpty else { return }
+
+        let data = samples.withUnsafeBufferPointer { buffer -> Data in
+            guard let baseAddress = buffer.baseAddress else { return Data() }
+            return Data(bytes: baseAddress, count: buffer.count * MemoryLayout<Float>.size)
+        }
+
+        send([
+            "type": "audio",
+            "sample_rate": sampleRate,
+            "data": data.base64EncodedString()
+        ])
+    }
+
     func shutdown() {
         send(["type": "shutdown"])
         process?.terminate()
@@ -99,13 +116,17 @@ final class EngineClient {
     }
 
     private func send(_ payload: [String: Any]) {
-        guard let inputHandle else { return }
-        do {
-            let data = try JSONSerialization.data(withJSONObject: payload)
-            inputHandle.write(data)
-            inputHandle.write(Data([0x0A]))
-        } catch {
-            onError?("Engine command failed: \(error.localizedDescription)")
+        writeQueue.async { [weak self] in
+            guard let self, let inputHandle = self.inputHandle else { return }
+            do {
+                let data = try JSONSerialization.data(withJSONObject: payload)
+                inputHandle.write(data)
+                inputHandle.write(Data([0x0A]))
+            } catch {
+                DispatchQueue.main.async {
+                    self.onError?("Engine command failed: \(error.localizedDescription)")
+                }
+            }
         }
     }
 

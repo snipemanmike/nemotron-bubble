@@ -10,6 +10,7 @@ assets = ["dep:png", "dep:gif"]
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 cpal = "0.15"
 crossbeam-channel = "0.5"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
