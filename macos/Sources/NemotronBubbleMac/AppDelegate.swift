@@ -13,9 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKey: HotKeyController?
     private var enterHotKey: HotKeyController?
     private var shortcutCaptureMonitor: Any?
-    private var commandHoldMonitor: Any?
-    private var commandHoldStartedRecording = false
-    private var commandHoldCancelled = false
+    private var modifierShortcutMonitor: Any?
+    private var modifierShortcutArmed = false
+    private var modifierShortcutCancelled = false
 
     private var startStopItem = NSMenuItem()
     private var settingsItem = NSMenuItem()
@@ -37,7 +37,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         configureSettingsWindow()
         configureEngineCallbacks()
         configureAudioCapture()
-        configureCommandHoldMonitor()
         engine.start()
         registerHotKey()
         LoginItemController.setEnabled(preferences.startAtLogin)
@@ -55,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         unregisterEnterHotKey()
-        removeCommandHoldMonitor()
+        removeModifierShortcutMonitor()
         audioCapture.stop()
         hotKey?.unregister()
         engine.shutdown()
@@ -152,22 +151,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func configureCommandHoldMonitor() {
-        removeCommandHoldMonitor()
-        commandHoldMonitor = NSEvent.addGlobalMonitorForEvents(
+    private func configureModifierShortcutMonitor() {
+        removeModifierShortcutMonitor()
+        modifierShortcutMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.flagsChanged, .keyDown]
         ) { [weak self] event in
             DispatchQueue.main.async {
-                self?.handleCommandHoldEvent(event)
+                self?.handleModifierShortcutEvent(event)
             }
         }
     }
 
-    private func removeCommandHoldMonitor() {
-        if let monitor = commandHoldMonitor {
+    private func removeModifierShortcutMonitor() {
+        if let monitor = modifierShortcutMonitor {
             NSEvent.removeMonitor(monitor)
-            commandHoldMonitor = nil
+            modifierShortcutMonitor = nil
         }
+        modifierShortcutArmed = false
+        modifierShortcutCancelled = false
     }
 
     private func rebuildMenu() {
@@ -418,54 +419,154 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .enterStopsRecording:
             preferences.enterStopsRecording.toggle()
             preferences.enterStopsRecording ? registerEnterHotKeyIfNeeded() : unregisterEnterHotKey()
-        case .commandHoldToRecord:
-            preferences.commandHoldToRecord.toggle()
         }
 
         setStatus("Settings saved.")
     }
 
-    private func handleCommandHoldEvent(_ event: NSEvent) {
-        guard preferences.commandHoldToRecord, shortcutCaptureMonitor == nil else { return }
+    private func handleModifierShortcutEvent(_ event: NSEvent) {
+        guard isModifierOnlyShortcut(), shortcutCaptureMonitor == nil else { return }
 
         if event.type == .keyDown {
-            if commandHoldStartedRecording,
-               event.modifierFlags.contains(.command),
-               Int(event.keyCode) != kVK_Command,
-               Int(event.keyCode) != kVK_RightCommand {
-                commandHoldCancelled = true
+            if modifierShortcutArmed {
+                modifierShortcutCancelled = true
             }
             return
         }
 
         guard event.type == .flagsChanged else { return }
-        let isCommandKey = Int(event.keyCode) == kVK_Command || Int(event.keyCode) == kVK_RightCommand
-        guard isCommandKey else {
-            if commandHoldStartedRecording, event.modifierFlags.contains(.command) {
-                commandHoldCancelled = true
+        let configuredModifiers = preferences.hotKeyModifiers
+        let currentModifiers = carbonModifiers(from: event.modifierFlags)
+
+        if !modifierShortcutArmed {
+            if currentModifiers == configuredModifiers {
+                modifierShortcutArmed = true
+                modifierShortcutCancelled = false
             }
             return
         }
 
-        let commandIsDown = event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command)
-        if commandIsDown {
-            if !engine.isRecording {
-                commandHoldCancelled = false
-                commandHoldStartedRecording = true
-                startRecording()
-            }
-        } else if commandHoldStartedRecording {
-            let shouldStop = engine.isRecording && !commandHoldCancelled
-            commandHoldStartedRecording = false
-            commandHoldCancelled = false
-            if shouldStop {
-                stopRecording(fast: false)
-            }
+        if currentModifiers == configuredModifiers {
+            return
         }
+
+        if currentModifiers & configuredModifiers == configuredModifiers {
+            modifierShortcutCancelled = true
+            return
+        }
+
+        let shouldToggle = !modifierShortcutCancelled
+        modifierShortcutArmed = false
+        modifierShortcutCancelled = false
+        if shouldToggle {
+            toggleRecording()
+        }
+    }
+
+    private func isModifierOnlyShortcut() -> Bool {
+        preferences.hotKeyCode == 0 && preferences.hotKeyModifiers != 0
+    }
+
+    private func captureModifierShortcut(from event: NSEvent) -> Bool {
+        guard event.type == .flagsChanged else { return false }
+        let modifiers = carbonModifiers(from: event.modifierFlags)
+        guard modifiers != 0 else { return false }
+
+        finishShortcutCaptureCleanup()
+        preferences.hotKeyCode = 0
+        preferences.hotKeyModifiers = modifiers
+        registerHotKey()
+        setStatus("Shortcut set to \(hotKeyLabel()).")
+        return true
+    }
+
+    private func finishShortcutCaptureCleanup() {
+        if let monitor = shortcutCaptureMonitor {
+            NSEvent.removeMonitor(monitor)
+            shortcutCaptureMonitor = nil
+        }
+        settingsWindow.setShortcutCaptureActive(false)
+    }
+
+    private func modifierLabel(_ modifiers: UInt32) -> String {
+        var parts: [String] = []
+        if modifiers & UInt32(controlKey) != 0 { parts.append("Ctrl") }
+        if modifiers & UInt32(optionKey) != 0 { parts.append("Option") }
+        if modifiers & UInt32(shiftKey) != 0 { parts.append("Shift") }
+        if modifiers & UInt32(cmdKey) != 0 { parts.append("Command") }
+        return parts.isEmpty ? "Shortcut" : parts.joined(separator: " + ")
+    }
+
+    private func modifierKeyCode(_ keyCode: Int) -> Bool {
+        switch keyCode {
+        case kVK_Command, kVK_RightCommand, kVK_Control, kVK_RightControl,
+             kVK_Option, kVK_RightOption, kVK_Shift, kVK_RightShift:
+            true
+        default:
+            false
+        }
+    }
+
+    private func modifierOnlyShortcutAvailable() -> Bool {
+        switch preferences.hotKeyModifiers {
+        case UInt32(controlKey), UInt32(optionKey), UInt32(shiftKey), UInt32(cmdKey):
+            true
+        default:
+            false
+        }
+    }
+
+    private func registerModifierOnlyShortcutIfNeeded() -> Bool {
+        guard isModifierOnlyShortcut() else { return false }
+        if modifierOnlyShortcutAvailable() {
+            configureModifierShortcutMonitor()
+        } else {
+            setStatus("\(hotKeyLabel()) unavailable. Choose one modifier key.")
+        }
+        return true
+    }
+
+    private func cancelShortcutCapture() {
+        finishShortcutCaptureCleanup()
+        registerHotKey()
+        setStatus("Shortcut unchanged.")
+    }
+
+    private func applyKeyShortcut(_ event: NSEvent) {
+        if Int(event.keyCode) == kVK_Escape {
+            cancelShortcutCapture()
+            return
+        }
+
+        if modifierKeyCode(Int(event.keyCode)) {
+            return
+        }
+
+        finishShortcutCaptureCleanup()
+
+        let modifiers = carbonModifiers(from: event.modifierFlags)
+        let needsModifier = isAlphaNumericKey(event.keyCode)
+        if modifiers == 0 && needsModifier {
+            registerHotKey()
+            setStatus("Add Control, Option, Shift, or Command to that key.")
+            return
+        }
+
+        preferences.hotKeyCode = UInt32(event.keyCode)
+        preferences.hotKeyModifiers = modifiers
+        registerHotKey()
+        setStatus("Shortcut set to \(hotKeyLabel()).")
     }
 
     private func registerHotKey() {
         hotKey?.unregister()
+        hotKey = nil
+        removeModifierShortcutMonitor()
+
+        if registerModifierOnlyShortcutIfNeeded() {
+            return
+        }
+
         let controller = HotKeyController(
             keyCode: preferences.hotKeyCode,
             modifiers: preferences.hotKeyModifiers
@@ -484,41 +585,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginShortcutCapture() {
         hotKey?.unregister()
+        removeModifierShortcutMonitor()
         settingsWindow.setShortcutCaptureActive(true)
         setStatus("Press your shortcut... Esc cancels.")
         NSApp.activate(ignoringOtherApps: true)
 
-        shortcutCaptureMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.finishShortcutCapture(event)
+        shortcutCaptureMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            guard let self else { return nil }
+            if self.captureModifierShortcut(from: event) {
+                return nil
+            }
+            if event.type == .keyDown {
+                self.applyKeyShortcut(event)
+            }
             return nil
         }
-    }
-
-    private func finishShortcutCapture(_ event: NSEvent) {
-        if let monitor = shortcutCaptureMonitor {
-            NSEvent.removeMonitor(monitor)
-            shortcutCaptureMonitor = nil
-        }
-        settingsWindow.setShortcutCaptureActive(false)
-
-        if Int(event.keyCode) == kVK_Escape {
-            registerHotKey()
-            setStatus("Shortcut unchanged.")
-            return
-        }
-
-        let modifiers = carbonModifiers(from: event.modifierFlags)
-        let needsModifier = isAlphaNumericKey(event.keyCode)
-        if modifiers == 0 && needsModifier {
-            registerHotKey()
-            setStatus("Add Control, Option, Shift, or Command to that key.")
-            return
-        }
-
-        preferences.hotKeyCode = UInt32(event.keyCode)
-        preferences.hotKeyModifiers = modifiers
-        registerHotKey()
-        setStatus("Shortcut set to \(hotKeyLabel()).")
     }
 
     private func registerEnterHotKeyIfNeeded() {
@@ -539,21 +620,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateStatusIcon() {
-        statusItem?.button?.image = NSImage(
-            systemSymbolName: engine.isRecording ? "mic.fill" : "mic.circle",
-            accessibilityDescription: "Nemotron Bubble"
-        )
-        statusItem?.button?.image?.isTemplate = true
-        if !engine.isRecording || !preferences.menuBarWaveformEnabled {
-            statusItem?.button?.title = ""
-        }
+        statusItem?.button?.image = makeMenuBarImage(level: 0, recording: engine.isRecording)
+        statusItem?.button?.title = ""
     }
 
     private func updateMenuBarWaveform(_ level: Float) {
-        guard engine.isRecording, preferences.menuBarWaveformEnabled else { return }
-        let bars = [" ", ".", ":", "|", "||", "|||"]
-        let index = min(bars.count - 1, max(0, Int(level * Float(bars.count - 1))))
-        statusItem?.button?.title = bars[index]
+        guard preferences.menuBarWaveformEnabled else { return }
+        statusItem?.button?.image = makeMenuBarImage(level: level, recording: engine.isRecording)
     }
 
     private func playStartSound() {
@@ -567,6 +640,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func hotKeyLabel() -> String {
+        if isModifierOnlyShortcut() {
+            return modifierLabel(preferences.hotKeyModifiers)
+        }
+
         var parts: [String] = []
         let modifiers = preferences.hotKeyModifiers
         if modifiers & UInt32(controlKey) != 0 { parts.append("Ctrl") }
@@ -619,6 +696,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         guard status == noErr, length > 0 else { return nil }
         return String(utf16CodeUnits: chars, count: length)
+    }
+
+    private func makeMenuBarImage(level: Float, recording: Bool) -> NSImage {
+        let size = NSSize(width: 22, height: 18)
+        let image = NSImage(size: size)
+        image.lockFocus()
+
+        NSColor.clear.setFill()
+        NSRect(origin: .zero, size: size).fill()
+
+        let color = recording ? NSColor.systemRed : NSColor.secondaryLabelColor
+        color.setFill()
+
+        let dot = NSBezierPath(ovalIn: NSRect(x: 1.5, y: 6.0, width: 6.0, height: 6.0))
+        dot.fill()
+
+        let bars = 5
+        let boosted = CGFloat(recording ? max(0.08, min(1.0, level)) : 0.20)
+        for index in 0..<bars {
+            let phase = CGFloat(index) / CGFloat(max(1, bars - 1))
+            let wave = 0.35 + 0.65 * sin((phase + boosted) * .pi)
+            let height = max(3.0, 12.0 * boosted * wave)
+            let rect = NSRect(
+                x: 10.0 + CGFloat(index) * 2.5,
+                y: (size.height - height) / 2.0,
+                width: 1.6,
+                height: height
+            )
+            NSBezierPath(roundedRect: rect, xRadius: 0.8, yRadius: 0.8).fill()
+        }
+
+        image.unlockFocus()
+        image.isTemplate = false
+        return image
     }
 
     private func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
