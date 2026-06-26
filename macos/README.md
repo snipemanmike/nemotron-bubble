@@ -3,10 +3,20 @@
 This branch adds a native macOS menu-bar dictation app while keeping the existing
 Windows Rust app unchanged.
 
+<p align="center">
+  <img src="../docs/macos-demo.gif" width="460" alt="Nemotron Bubble running on macOS" />
+</p>
+
 The macOS app uses the same `parakeet-rs` / NVIDIA Nemotron ONNX transcription
 path as the Windows app. The app shell is Swift/AppKit because the original UI is
 direct Win32 code, but transcription, chunking, final flush, and silence auto-stop
 run through the bundled Rust `nemotron-engine` helper.
+
+## Screenshots
+
+<img src="../docs/macos-bubble.png" width="304" alt="macOS waveform bubble" />
+
+<img src="../docs/macos-settings.png" width="620" alt="macOS settings window" />
 
 ## Build and run
 
@@ -40,8 +50,18 @@ clipboard so you can paste it manually.
 | Action | How |
 | --- | --- |
 | Start / stop dictation | `Ctrl-Space`, menu item, or click the bubble |
+| Use bare Command | Open settings, click *Global shortcut*, press `Command` |
 | Move bubble | Drag it |
 | Open settings | Click the bubble or choose Settings from the menu bar item |
 | Copy latest transcript | Menu bar item |
 | Paste latest transcript | Menu bar item |
 | Toggle auto-copy / auto-paste / live typing / bubble | Settings window or menu bar items |
+
+## README Art
+
+```bash
+swift macos/render-readme-assets.swift
+```
+
+The generated assets are synthetic, so they do not capture your desktop,
+filenames, documents, or dictated text.
