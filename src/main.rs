@@ -98,7 +98,7 @@ const ANIM_TIMER_ID: usize = 77;
 const ANIM_INTERVAL_MS: u32 = 33; // ~30 fps
 
 const SETTINGS_WIDTH: i32 = 700;
-const SETTINGS_HEIGHT: i32 = 748;
+const SETTINGS_HEIGHT: i32 = 792;
 const HISTORY_EDIT_ID: usize = 3001;
 const NEMOTRON_SAMPLE_RATE: f64 = 16_000.0;
 const NEMOTRON_CHUNK_SIZE: usize = 8_960; // 560 ms at 16 kHz.
@@ -118,6 +118,7 @@ const SETTINGS_TOGGLE_BUBBLE_CLICK_SETTINGS: usize = 2008;
 const SETTINGS_TOGGLE_FLOATING_BUBBLE: usize = 2009;
 const SETTINGS_TOGGLE_TRAY_WAVEFORM: usize = 2010;
 const SETTINGS_TOGGLE_ENTER_STOPS: usize = 2011;
+const SETTINGS_TOGGLE_SILENCE_STOP: usize = 2012;
 
 static APP: OnceCell<Arc<AppState>> = OnceCell::new();
 static UI_FONT: OnceCell<isize> = OnceCell::new();
@@ -151,6 +152,7 @@ struct AppSettings {
     show_floating_bubble: bool,
     tray_waveform_enabled: bool,
     enter_stops_recording: bool,
+    silence_auto_stop: bool,
     hotkey_mods: u32,
     hotkey_vk: u32,
     paste_delay_ms: u64,
@@ -173,6 +175,7 @@ impl Default for AppSettings {
             show_floating_bubble: true,
             tray_waveform_enabled: true,
             enter_stops_recording: false,
+            silence_auto_stop: true,
             hotkey_mods: MOD_CONTROL,
             hotkey_vk: VK_SPACE as u32,
             paste_delay_ms: 60,
@@ -404,6 +407,9 @@ fn toggle_setting(app: &Arc<AppState>, id: usize) {
             }
             SETTINGS_TOGGLE_ENTER_STOPS => {
                 settings.enter_stops_recording = !settings.enter_stops_recording
+            }
+            SETTINGS_TOGGLE_SILENCE_STOP => {
+                settings.silence_auto_stop = !settings.silence_auto_stop
             }
             _ => {}
         }
@@ -2001,6 +2007,7 @@ fn handle_settings_click(x: i32, y: i32) {
         SETTINGS_TOGGLE_FLOATING_BUBBLE,
         SETTINGS_TOGGLE_TRAY_WAVEFORM,
         SETTINGS_TOGGLE_ENTER_STOPS,
+        SETTINGS_TOGGLE_SILENCE_STOP,
     ] {
         if settings_toggle_rect(id).contains(x, y) {
             toggle_setting(app, id);
@@ -2465,8 +2472,11 @@ unsafe fn on_anim_tick(hwnd: HWND) {
     };
 
     // Auto-stop after a stretch of silence so a forgotten recording cannot run
-    // forever (and let the model's audio buffer grow without bound).
-    if recording && silent_for >= Duration::from_secs(SILENCE_AUTO_STOP_SECS) {
+    // forever (and let the model's audio buffer grow without bound). Optional.
+    if recording
+        && settings.silence_auto_stop
+        && silent_for >= Duration::from_secs(SILENCE_AUTO_STOP_SECS)
+    {
         stop_recording(app);
         update_ui(app, |ui| {
             ui.status = format!("Auto-stopped after {SILENCE_AUTO_STOP_SECS}s of silence.");
@@ -2565,6 +2575,12 @@ fn setting_rows(settings: &AppSettings) -> Vec<SettingRow> {
             title: "Enter stops recording",
             detail: "Press Enter to finish and submit the text.",
             enabled: settings.enter_stops_recording,
+        },
+        SettingRow {
+            id: SETTINGS_TOGGLE_SILENCE_STOP,
+            title: "Auto-stop on silence",
+            detail: "Stop after 15s with no speech. Off to pause freely.",
+            enabled: settings.silence_auto_stop,
         },
     ]
 }
@@ -2982,6 +2998,7 @@ fn settings_toggle_rect(id: usize) -> RectI {
         SETTINGS_TOGGLE_FLOATING_BUBBLE => 8,
         SETTINGS_TOGGLE_TRAY_WAVEFORM => 9,
         SETTINGS_TOGGLE_ENTER_STOPS => 10,
+        SETTINGS_TOGGLE_SILENCE_STOP => 11,
         _ => 0,
     };
     // Toggles begin below the shortcut row.
